@@ -90,6 +90,7 @@ class GenerationRequest(msgspec.Struct):
 class HeartbeatRequest(msgspec.Struct):
     request_id: str
     proxy_addr: str
+    send_timestamp: Optional[float] = None  # Timestamp when proxy sends the request
 
 
 class HeartbeatResponse(msgspec.Struct):

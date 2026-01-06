@@ -91,6 +91,11 @@ class DisaggWorker:
             if is_addr_ipv6(address) and self.transfer_protocol == "tcp":
                 self.ctx.setsockopt(zmq.constants.IPV6, 1)
             self.from_proxy = self.ctx.socket(zmq.constants.PULL)
+            # Increase receive high water mark to handle burst traffic
+            # Default is 1000, increase to 10000 to prevent message dropping
+            rcvhwm = int(os.environ.get("LM_SERVICE_ZMQ_RCVHWM", "10000"))
+            self.from_proxy.setsockopt(zmq.RCVHWM, rcvhwm)
+            logger.info(f"Worker PULL socket RCVHWM set to {rcvhwm}")
             self.from_proxy.bind(self.worker_addr)
             self.metastore_client = (
                 MetastoreClientFactory.create_metastore_client(
@@ -113,11 +118,20 @@ class DisaggWorker:
             if is_addr_ipv6(address) and self.transfer_protocol == "tcp":
                 self.ctx.setsockopt(zmq.constants.IPV6, 1)
             self.from_proxy = self.ctx.socket(zmq.constants.PULL)
+            # Increase receive high water mark to handle burst traffic
+            # Default is 1000, increase to 10000 to prevent message dropping
+            rcvhwm = int(os.environ.get("LM_SERVICE_ZMQ_RCVHWM", "10000"))
+            self.from_proxy.setsockopt(zmq.RCVHWM, rcvhwm)
+            logger.info(f"Worker PULL socket RCVHWM set to {rcvhwm}")
             self.from_proxy.bind(self.worker_addr)
             for addr in self.proxy_addr_list:
                 socket = self.ctx.socket(zmq.constants.PUSH)
+                # Increase send high water mark for response sending
+                sndhwm = int(os.environ.get("LM_SERVICE_ZMQ_SNDHWM", "10000"))
+                socket.setsockopt(zmq.SNDHWM, sndhwm)
                 socket.connect(addr)
                 self.to_proxy[addr] = socket
+            logger.info(f"Worker PUSH socket SNDHWM set to {sndhwm}")
             logger.info(
                 f"Worker address: {self.worker_addr}, proxy_addr: {self.proxy_addr_list}"
             )
@@ -234,8 +248,21 @@ class DisaggWorker:
             if not events:
                 continue
             if self.from_proxy in events:
+                # Batch receive messages to reduce latency under high load
+                # and prioritize HEARTBEAT requests
+                batch_requests = []
+                batch_start_time = time.time()
                 try:
-                    req_type, req_data = await self.from_proxy.recv_multipart()
+                    # Receive all available messages in the queue
+                    while True:
+                        try:
+                            req_type, req_data = await self.from_proxy.recv_multipart(
+                                flags=zmq.NOBLOCK
+                            )
+                            batch_requests.append((req_type, req_data, time.time()))
+                        except zmq.Again:
+                            # No more messages available
+                            break
                 except zmq.ZMQError:
                     # When the worker is stopping, the socket may be closed.
                     # So we don't raise error.
@@ -245,7 +272,72 @@ class DisaggWorker:
                         )
                         break
                     raise
-                await self._handle_request(req_type, req_data)
+                
+                # Prioritize HEARTBEAT and METRICS requests for faster response
+                heartbeat_requests = []
+                metrics_requests = []
+                other_requests = []
+                
+                for req_type, req_data, recv_time in batch_requests:
+                    if req_type == RequestType.HEARTBEAT:
+                        heartbeat_requests.append((req_type, req_data, recv_time))
+                    elif req_type == RequestType.METRICS:
+                        metrics_requests.append((req_type, req_data, recv_time))
+                    else:
+                        other_requests.append((req_type, req_data, recv_time))
+                
+                # Log message queue status if there's accumulation
+                total_messages = len(batch_requests)
+                if total_messages > 1:
+                    logger.info(
+                        f"Batch received {total_messages} messages: "
+                        f"HEARTBEAT={len(heartbeat_requests)}, "
+                        f"METRICS={len(metrics_requests)}, "
+                        f"OTHERS={len(other_requests)}"
+                    )
+                    
+                    # Log warning if HEARTBEAT is delayed by many other requests
+                    if heartbeat_requests and other_requests:
+                        # Find position of first heartbeat in original batch
+                        first_hb_pos = next(
+                            i for i, (t, _, _) in enumerate(batch_requests)
+                            if t == RequestType.HEARTBEAT
+                        )
+                        if first_hb_pos > 10:
+                            logger.warning(
+                                f"HEARTBEAT request was delayed by {first_hb_pos} "
+                                f"other requests in queue (total queue size: {total_messages})"
+                            )
+                
+                # Log if batch is suspiciously large
+                if total_messages > 100:
+                    logger.warning(
+                        f"Large message batch ({total_messages}) - "
+                        f"worker may not be keeping up with incoming request rate"
+                    )
+                
+                # Process in priority order: HEARTBEAT > METRICS > others
+                for req_type, req_data, recv_time in (
+                    heartbeat_requests + metrics_requests + other_requests
+                ):
+                    # Log processing delay for HEARTBEAT requests
+                    if req_type == RequestType.HEARTBEAT:
+                        processing_delay = time.time() - recv_time
+                        if processing_delay > 1.0:
+                            logger.warning(
+                                f"HEARTBEAT processing delayed by {processing_delay:.2f}s "
+                                f"(queue had {len(other_requests)} other requests)"
+                            )
+                        elif processing_delay > 0.1:
+                            logger.info(
+                                f"HEARTBEAT processed with {processing_delay:.3f}s delay"
+                            )
+                        else:
+                            logger.debug(
+                                f"HEARTBEAT processed with {processing_delay:.3f}s delay"
+                            )
+                    
+                    await self._handle_request(req_type, req_data)
         await self._exit_done_event.wait()
         logger.info("Worker loop stopped.")
 
@@ -306,6 +398,15 @@ class DisaggWorker:
         self.engine.abort(request_id=req.request_id)
 
     async def _heartbeat_handler(self, req: HeartbeatRequest):
+        # Log network + queue transfer delay if timestamp is available
+        if req.send_timestamp is not None:
+            recv_time = time.time()
+            network_delay = recv_time - req.send_timestamp
+            if network_delay > 1.0:
+                logger.warning(
+                    f"HEARTBEAT delay: {network_delay:.3f}s (from proxy send to worker recv)"
+                )
+        
         msg = (
             ResponseType.HEARTBEAT,
             self.encoder.encode(

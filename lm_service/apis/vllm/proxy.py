@@ -309,11 +309,15 @@ class Proxy(EngineClient):
             A dict of connected ZMQ PUSH sockets, with addr as key.
         """
         to_sockets = {}
+        # Increase send high water mark to handle burst traffic
+        # Default is 1000, increase to 10000 to prevent blocking
+        sndhwm = int(os.environ.get("LM_SERVICE_ZMQ_SNDHWM", "10000"))
         for addr in addr_list:
             socket = self.ctx.socket(zmq.constants.PUSH)
+            socket.setsockopt(zmq.SNDHWM, sndhwm)
             socket.connect(addr)
             to_sockets[addr] = socket
-            logger.info(f"Connected to worker {addr} success")
+            logger.info(f"Connected to worker {addr} success (SNDHWM={sndhwm})")
         return to_sockets
 
     async def _process_request(
@@ -695,8 +699,11 @@ class Proxy(EngineClient):
                 self._run_output_handler()
             )
         request_id = str(uuid.uuid4())
+        send_time = time.time()
         request = HeartbeatRequest(
-            request_id=request_id, proxy_addr=self.proxy_addr
+            request_id=request_id, 
+            proxy_addr=self.proxy_addr,
+            send_timestamp=send_time
         )
         q: asyncio.Queue = asyncio.Queue()
         self.queues[request_id] = q
@@ -706,7 +713,23 @@ class Proxy(EngineClient):
             socket = await self._get_socket_and_server_types_from_addr(
                 addr, server_type
             )
+            # Monitor send operation duration
+            send_start = time.time()
             await socket.send_multipart(msg, copy=False)
+            send_duration = time.time() - send_start
+            if send_duration > 0.5:
+                logger.warning(
+                    f"HEARTBEAT send to {addr} took {send_duration:.3f}s - "
+                    f"ZMQ PUSH queue may be full or blocking"
+                )
+            elif send_duration > 0.1:
+                logger.info(
+                    f"HEARTBEAT send to {addr} took {send_duration:.3f}s"
+                )
+            else:
+                logger.debug(
+                    f"HEARTBEAT send to {addr} took {send_duration:.3f}s"
+                )
             response = await q.get()
             if (
                 isinstance(response, HeartbeatResponse)
