@@ -93,7 +93,7 @@ class Proxy(EngineClient):
         router: type[RoutingInterface] = RandomRouter,
         enable_health_monitor: bool = True,
         health_check_interval: float = 10.0,
-        health_threshold: int = 3,
+        health_threshold: int = 10,
         transfer_protocol: Optional[str] = None,
         metastore_client_config: Optional[dict] = None,
         log_stats: bool = True,
