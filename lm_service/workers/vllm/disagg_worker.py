@@ -540,10 +540,15 @@ class DisaggWorker:
                     None, _decode_mm_data, req.multi_modal_data
                 )
 
-            generator = self.engine.generate(
-                prompt=prompt_payload,
-                sampling_params=req.sampling_params,
-                request_id=request_id,
+            # Run engine.generate in executor to avoid blocking the event loop
+            # during heavy input processing (e.g. multimodal data)
+            loop = asyncio.get_running_loop()
+            generator = await loop.run_in_executor(
+                None,
+                self.engine.generate,
+                prompt_payload,
+                req.sampling_params,
+                request_id,
             )
 
             async for request_output in generator:
