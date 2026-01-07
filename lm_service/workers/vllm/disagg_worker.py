@@ -146,6 +146,8 @@ class DisaggWorker:
         self._force_log_task: Optional[asyncio.Task] = None
         self._exit_done_event = asyncio.Event()
         self._exit_started = False
+        # Limit concurrent multimodal initializations to prevent event loop blocking
+        self.mm_init_semaphore = asyncio.Semaphore(1)
 
     def shutdown(self):
         for socket in self.to_proxy.values():
@@ -535,20 +537,25 @@ class DisaggWorker:
             if req.prompt_token_ids is not None:
                 prompt_payload["prompt_token_ids"] = req.prompt_token_ids
             if req.multi_modal_data is not None:
-                loop = asyncio.get_running_loop()
-                prompt_payload["multi_modal_data"] = await loop.run_in_executor(
-                    None, _decode_mm_data, req.multi_modal_data
-                )
+                # Use semaphore to prevent stacking of heavy initialization tasks
+                async with self.mm_init_semaphore:
+                    # Explicit yield to let heartbeats pass through before blocking again
+                    await asyncio.sleep(0)
+                    
+                    loop = asyncio.get_running_loop()
+                    prompt_payload["multi_modal_data"] = await loop.run_in_executor(
+                        None, _decode_mm_data, req.multi_modal_data
+                    )
 
-                # Run engine.generate in executor to avoid blocking the event loop
-                # during heavy input processing (e.g. multimodal data)
-                generator = await loop.run_in_executor(
-                    None,
-                    self.engine.generate,
-                    prompt_payload,
-                    req.sampling_params,
-                    request_id,
-                )
+                    # We revert to running engine.generate in the main loop because
+                    # running it in an executor is risky if vLLM internal state is not thread-safe.
+                    # However, thanks to the semaphore above, we ensure these blocking calls
+                    # happen one at a time, with gaps for heartbeats.
+                    generator = self.engine.generate(
+                        prompt=prompt_payload,
+                        sampling_params=req.sampling_params,
+                        request_id=request_id,
+                    )
             else:
                 generator = self.engine.generate(
                     prompt=prompt_payload,
