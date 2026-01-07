@@ -237,6 +237,12 @@ class DisaggWorker:
         self.running_requests.add(self._force_log_task)
         self._force_log_task.add_done_callback(self.running_requests.discard)
 
+        # Enable asyncio debug mode to log slow callbacks (blocking the loop)
+        loop = asyncio.get_running_loop()
+        loop.set_debug(True)
+        # Log warnings if a callback takes more than 100ms
+        loop.slow_callback_duration = 0.1
+
         async def _monitor_cpu():
             process = psutil.Process()
             try:
