@@ -4,9 +4,11 @@
 import asyncio
 import os
 import time
+import threading
 from PIL import Image
 import uuid
 from typing import Any, Optional, Union
+import psutil
 
 import msgspec
 import numpy as np
@@ -44,7 +46,7 @@ from lm_service.metastore_client.metastore_client_config import (
 from lm_service.metastore_client.metastore_client import (
     MetastoreClientBase,
 )
-from lm_service.utils import is_addr_ipv6
+from lm_service.utils import is_addr_ipv6, get_heartbeat_addr
 
 from lm_service.logger_utils import init_logger
 
@@ -135,6 +137,25 @@ class DisaggWorker:
             logger.info(
                 f"Worker address: {self.worker_addr}, proxy_addr: {self.proxy_addr_list}"
             )
+
+        # Heartbeat sidecar setup
+        self.hb_addr = get_heartbeat_addr(self.worker_addr)
+        self.hb_ctx = zmq.Context()
+        self.hb_socket = self.hb_ctx.socket(zmq.REP)
+        try:
+            self.hb_socket.bind(self.hb_addr)
+            logger.info(f"Worker heartbeat socket bound to {self.hb_addr}")
+        except zmq.ZMQError as e:
+            logger.error(f"Failed to bind heartbeat socket to {self.hb_addr}: {e}")
+            raise
+
+        self.hb_thread = threading.Thread(
+            target=self._run_heartbeat_loop,
+            name="HeartbeatLoop",
+            daemon=True
+        )
+        self.hb_thread.start()
+
         self.decoder_generate = msgspec.msgpack.Decoder(GenerationRequest)
         self.decoder_heartbeat = msgspec.msgpack.Decoder(HeartbeatRequest)
         self.decoder_abort = msgspec.msgpack.Decoder(GenerationRequest)
@@ -144,10 +165,19 @@ class DisaggWorker:
         self.running_requests: set[asyncio.Task] = set()
         self.poller = zmq.asyncio.Poller()
         self._force_log_task: Optional[asyncio.Task] = None
+        self._cpu_monitor_task: Optional[asyncio.Task] = None
         self._exit_done_event = asyncio.Event()
         self._exit_started = False
+        # Limit concurrent multimodal initializations to prevent event loop blocking
+        self.mm_init_semaphore = asyncio.Semaphore(1)
 
     def shutdown(self):
+        self.stopping = True
+        
+        # Cleanup heartbeat resources
+        if hasattr(self, "hb_ctx"):
+            self.hb_ctx.destroy()
+            
         for socket in self.to_proxy.values():
             socket.close(
                 linger=lm_service_envs.LM_SERVICE_WORKER_GRACEFUL_EXIT_TIMEOUT_SEC
@@ -232,6 +262,32 @@ class DisaggWorker:
         )
         self.running_requests.add(self._force_log_task)
         self._force_log_task.add_done_callback(self.running_requests.discard)
+
+        # Enable asyncio debug mode to log slow callbacks (blocking the loop)
+        loop = asyncio.get_running_loop()
+        loop.set_debug(True)
+        # Log warnings if a callback takes more than 100ms
+        loop.slow_callback_duration = 0.1
+
+        async def _monitor_cpu():
+            process = psutil.Process()
+            try:
+                while True:
+                    await asyncio.sleep(5)
+                    # cpu_percent(interval=None) returns cpu usage since last call
+                    cpu_percent = process.cpu_percent(interval=None)
+                    # Also get system wide cpu percent
+                    sys_cpu = psutil.cpu_percent(interval=None)
+                    logger.info(f"CPU Usage - Process: {cpu_percent}%, System: {sys_cpu}%")
+            except asyncio.CancelledError:
+                pass
+
+        self._cpu_monitor_task = asyncio.create_task(
+            _monitor_cpu(), name="cpu_monitor"
+        )
+        self.running_requests.add(self._cpu_monitor_task)
+        self._cpu_monitor_task.add_done_callback(self.running_requests.discard)
+
         while not self.stopping:
             # poll for requests from proxy
             # if worker is stopping, exit the loop
@@ -380,6 +436,51 @@ class DisaggWorker:
 
         await self.to_proxy[req.proxy_addr].send_multipart(msg, copy=False)
 
+    def _run_heartbeat_loop(self):
+        """
+        Runs in a separate thread to handle heartbeat requests independently
+        of the main event loop. Uses synchronous ZMQ REP socket.
+        """
+        logger.info(f"Heartbeat loop started on {self.hb_addr}")
+        poller = zmq.Poller()
+        poller.register(self.hb_socket, zmq.POLLIN)
+        
+        while not self.stopping:
+            try:
+                # Poll with timeout to allow checking self.stopping
+                socks = dict(poller.poll(1000))
+                if self.hb_socket in socks:
+                    # Receive request
+                    frames = self.hb_socket.recv_multipart()
+                    if len(frames) >= 2:
+                        req_type, req_data = frames[0], frames[1]
+                        
+                        if req_type == RequestType.HEARTBEAT:
+                            try:
+                                hb_req = self.decoder_heartbeat.decode(req_data)
+                                # Send response immediately
+                                resp = HeartbeatResponse(
+                                    request_id=hb_req.request_id, 
+                                    status="OK"
+                                )
+                                self.hb_socket.send_multipart(
+                                    [ResponseType.HEARTBEAT, self.encoder.encode(resp)]
+                                )
+                            except Exception as e:
+                                logger.error(f"Error processing heartbeat: {e}")
+                                # Send empty frame to satisfy REP socket if decoding fails
+                                self.hb_socket.send(b"")
+                        else:
+                            # Unknown request type on HB socket
+                            self.hb_socket.send(b"")
+                    else:
+                        self.hb_socket.send(b"")
+            except zmq.ContextTerminated:
+                break
+            except Exception as e:
+                if not self.stopping:
+                    logger.error(f"Error in heartbeat loop: {e}")
+
     async def _encode_handler(self, req: GenerationRequest):
         task = asyncio.create_task(
             self._generate(req, lambda b: (ResponseType.ENCODE, b))
@@ -435,18 +536,19 @@ class DisaggWorker:
         self._exit_started = True
         if not self.stopping:
             self.stopping = True
-        # cancel force log task
+            # cancel force log task
         try:
-            log_task = getattr(self, "_force_log_task", None)
-            if log_task:
-                log_task.cancel()
-                try:
-                    await asyncio.wait_for(log_task, timeout=1)
-                except Exception:
-                    pass
-                self.running_requests.discard(log_task)
-                self._force_log_task = None
-                logger.info("Force log task cancelled during shutdown.")
+            for task_name in ["_force_log_task", "_cpu_monitor_task"]:
+                task = getattr(self, task_name, None)
+                if task:
+                    task.cancel()
+                    try:
+                        await asyncio.wait_for(task, timeout=1)
+                    except Exception:
+                        pass
+                    self.running_requests.discard(task)
+                    setattr(self, task_name, None)
+                    logger.info(f"{task_name} cancelled during shutdown.")
             # wait for all running requests to finish
             pending = {t for t in self.running_requests if not t.done()}
             if pending:
@@ -535,15 +637,31 @@ class DisaggWorker:
             if req.prompt_token_ids is not None:
                 prompt_payload["prompt_token_ids"] = req.prompt_token_ids
             if req.multi_modal_data is not None:
-                prompt_payload["multi_modal_data"] = _decode_mm_data(
-                    req.multi_modal_data
-                )
+                # Use semaphore to prevent stacking of heavy initialization tasks
+                async with self.mm_init_semaphore:
+                    # Explicit yield to let heartbeats pass through before blocking again
+                    await asyncio.sleep(0)
+                    
+                    loop = asyncio.get_running_loop()
+                    prompt_payload["multi_modal_data"] = await loop.run_in_executor(
+                        None, _decode_mm_data, req.multi_modal_data
+                    )
 
-            generator = self.engine.generate(
-                prompt=prompt_payload,
-                sampling_params=req.sampling_params,
-                request_id=request_id,
-            )
+                    # We revert to running engine.generate in the main loop because
+                    # running it in an executor is risky if vLLM internal state is not thread-safe.
+                    # However, thanks to the semaphore above, we ensure these blocking calls
+                    # happen one at a time, with gaps for heartbeats.
+                    generator = self.engine.generate(
+                        prompt=prompt_payload,
+                        sampling_params=req.sampling_params,
+                        request_id=request_id,
+                    )
+            else:
+                generator = self.engine.generate(
+                    prompt=prompt_payload,
+                    sampling_params=req.sampling_params,
+                    request_id=request_id,
+                )
 
             async for request_output in generator:
                 response = GenerationResponse.from_request_output(
