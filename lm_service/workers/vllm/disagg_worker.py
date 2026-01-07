@@ -7,6 +7,7 @@ import time
 from PIL import Image
 import uuid
 from typing import Any, Optional, Union
+import psutil
 
 import msgspec
 import numpy as np
@@ -144,6 +145,7 @@ class DisaggWorker:
         self.running_requests: set[asyncio.Task] = set()
         self.poller = zmq.asyncio.Poller()
         self._force_log_task: Optional[asyncio.Task] = None
+        self._cpu_monitor_task: Optional[asyncio.Task] = None
         self._exit_done_event = asyncio.Event()
         self._exit_started = False
         # Limit concurrent multimodal initializations to prevent event loop blocking
@@ -234,6 +236,26 @@ class DisaggWorker:
         )
         self.running_requests.add(self._force_log_task)
         self._force_log_task.add_done_callback(self.running_requests.discard)
+
+        async def _monitor_cpu():
+            process = psutil.Process()
+            try:
+                while True:
+                    await asyncio.sleep(5)
+                    # cpu_percent(interval=None) returns cpu usage since last call
+                    cpu_percent = process.cpu_percent(interval=None)
+                    # Also get system wide cpu percent
+                    sys_cpu = psutil.cpu_percent(interval=None)
+                    logger.info(f"CPU Usage - Process: {cpu_percent}%, System: {sys_cpu}%")
+            except asyncio.CancelledError:
+                pass
+
+        self._cpu_monitor_task = asyncio.create_task(
+            _monitor_cpu(), name="cpu_monitor"
+        )
+        self.running_requests.add(self._cpu_monitor_task)
+        self._cpu_monitor_task.add_done_callback(self.running_requests.discard)
+
         while not self.stopping:
             # poll for requests from proxy
             # if worker is stopping, exit the loop
@@ -437,18 +459,19 @@ class DisaggWorker:
         self._exit_started = True
         if not self.stopping:
             self.stopping = True
-        # cancel force log task
+            # cancel force log task
         try:
-            log_task = getattr(self, "_force_log_task", None)
-            if log_task:
-                log_task.cancel()
-                try:
-                    await asyncio.wait_for(log_task, timeout=1)
-                except Exception:
-                    pass
-                self.running_requests.discard(log_task)
-                self._force_log_task = None
-                logger.info("Force log task cancelled during shutdown.")
+            for task_name in ["_force_log_task", "_cpu_monitor_task"]:
+                task = getattr(self, task_name, None)
+                if task:
+                    task.cancel()
+                    try:
+                        await asyncio.wait_for(task, timeout=1)
+                    except Exception:
+                        pass
+                    self.running_requests.discard(task)
+                    setattr(self, task_name, None)
+                    logger.info(f"{task_name} cancelled during shutdown.")
             # wait for all running requests to finish
             pending = {t for t in self.running_requests if not t.done()}
             if pending:
