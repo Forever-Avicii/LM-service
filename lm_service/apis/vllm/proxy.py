@@ -61,7 +61,7 @@ from lm_service.metastore_client.metastore_client_config import (
     MetastoreClientConfig,
     json_to_metastore_config,
 )
-from lm_service.utils import is_addr_ipv6
+from lm_service.utils import is_addr_ipv6, get_heartbeat_addr
 
 from lm_service.logger_utils import init_logger
 
@@ -698,55 +698,58 @@ class Proxy(EngineClient):
             self.output_handler = asyncio.create_task(
                 self._run_output_handler()
             )
+        
+        # Use dedicated Heartbeat socket (REQ-REP pattern)
+        # This bypasses the main data channel to avoid head-of-line blocking
+        hb_addr = get_heartbeat_addr(addr)
         request_id = str(uuid.uuid4())
         send_time = time.time()
+        
         request = HeartbeatRequest(
             request_id=request_id, 
             proxy_addr=self.proxy_addr,
             send_timestamp=send_time
         )
-        q: asyncio.Queue = asyncio.Queue()
-        self.queues[request_id] = q
+        
+        socket = None
         try:
+            # Create a temporary REQ socket for this check
+            # In production, you might want to pool these sockets
+            socket = self.ctx.socket(zmq.REQ)
+            # Set timeout to avoid hanging indefinitely if worker is down
+            socket.setsockopt(zmq.RCVTIMEO, int(self.health_check_interval * 1000))
+            socket.setsockopt(zmq.SNDTIMEO, int(self.health_check_interval * 1000))
+            socket.connect(hb_addr)
+            
             payload = self.encoder.encode(request)
             msg = (RequestType.HEARTBEAT, payload)
-            socket = await self._get_socket_and_server_types_from_addr(
-                addr, server_type
-            )
-            # Monitor send operation duration
-            send_start = time.time()
-            await socket.send_multipart(msg, copy=False)
-            send_duration = time.time() - send_start
-            if send_duration > 0.5:
-                logger.warning(
-                    f"HEARTBEAT send to {addr} took {send_duration:.3f}s - "
-                    f"ZMQ PUSH queue may be full or blocking"
-                )
-            elif send_duration > 0.1:
-                logger.info(
-                    f"HEARTBEAT send to {addr} took {send_duration:.3f}s"
-                )
-            else:
-                logger.debug(
-                    f"HEARTBEAT send to {addr} took {send_duration:.3f}s"
-                )
-            response = await q.get()
-            if (
-                isinstance(response, HeartbeatResponse)
-                and response.status == "OK"
-            ):
-                return True
-            elif isinstance(response, Exception):
-                raise response
-            else:
-                return False
+            
+            # Send request
+            await socket.send_multipart(msg)
+            
+            # Receive response
+            frames = await socket.recv_multipart()
+            if len(frames) >= 2:
+                resp_type, resp_data = frames[0], frames[1]
+                if resp_type == ResponseType.HEARTBEAT:
+                    # Decoding is optional if we just check connectivity, 
+                    # but let's check basic validity
+                    return True
+            
+            return False
 
+        except zmq.Again:
+            # Timeout
+            logger.warning(f"Health check timeout for {server_type} {addr} (HB port {hb_addr})")
+            return False
         except Exception as e:
-            raise RuntimeError(
-                f"Health check failed for {server_type} {addr}, exception: {e}"
-            ) from e
+            logger.warning(
+                f"Health check failed for {server_type} {addr} (HB port {hb_addr}), exception: {e}"
+            )
+            return False
         finally:
-            self.queues.pop(request_id, None)
+            if socket:
+                socket.close(linger=0)
 
     async def fetch_metrics_from_instance(
         self, server_type: ServerType, addr: str
