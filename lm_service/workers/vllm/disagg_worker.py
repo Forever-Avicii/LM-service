@@ -535,8 +535,9 @@ class DisaggWorker:
             if req.prompt_token_ids is not None:
                 prompt_payload["prompt_token_ids"] = req.prompt_token_ids
             if req.multi_modal_data is not None:
-                prompt_payload["multi_modal_data"] = _decode_mm_data(
-                    req.multi_modal_data
+                loop = asyncio.get_running_loop()
+                prompt_payload["multi_modal_data"] = await loop.run_in_executor(
+                    None, _decode_mm_data, req.multi_modal_data
                 )
 
             generator = self.engine.generate(
